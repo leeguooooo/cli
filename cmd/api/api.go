@@ -238,7 +238,9 @@ func apiRun(opts *APIOptions) error {
 
 	resp, err := ac.DoAPI(opts.Ctx, request)
 	if err != nil {
-		return output.MarkRaw(client.WrapDoAPIError(err))
+		// DoSDKRequest wraps SDK failures at the APIClient boundary; this
+		// return is now identity for typed errors.
+		return err
 	}
 	err = client.HandleResponse(resp, client.ResponseOptions{
 		OutputPath:  opts.Output,
@@ -248,11 +250,15 @@ func apiRun(opts *APIOptions) error {
 		ErrOut:      f.IOStreams.ErrOut,
 		FileIO:      f.ResolveFileIO(opts.Ctx),
 		CommandPath: opts.Cmd.CommandPath(),
+		Identity:    opts.As,
+		// Stage 1: CheckResponse emits the legacy *output.ExitError envelope.
+		// Per-domain migration in stage 2+ will route through
+		// errclass.BuildAPIError to populate identity-aware fields
+		// (PermissionError.ConsoleURL needs Brand+AppID from the client).
+		CheckError: ac.CheckResponse,
 	})
-	// MarkRaw tells root error handler to skip enrichPermissionError,
-	// preserving the original API error detail (log_id, troubleshooter, etc.).
 	if err != nil {
-		return output.MarkRaw(err)
+		return err
 	}
 	return nil
 }
@@ -262,10 +268,13 @@ func apiDryRun(f *cmdutil.Factory, request client.RawApiRequest, config *core.Cl
 }
 
 func apiPaginate(ctx context.Context, ac *client.APIClient, request client.RawApiRequest, format output.Format, jqExpr string, out, errOut io.Writer, pagOpts client.PaginationOptions) error {
+	if pagOpts.Identity == "" {
+		pagOpts.Identity = request.As
+	}
 	// When jq is set, always aggregate all pages then filter.
 	if jqExpr != "" {
-		if err := client.PaginateWithJq(ctx, ac, request, jqExpr, out, pagOpts, client.CheckLarkResponse); err != nil {
-			return output.MarkRaw(err)
+		if err := client.PaginateWithJq(ctx, ac, request, jqExpr, out, pagOpts, ac.CheckResponse); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -277,11 +286,11 @@ func apiPaginate(ctx context.Context, ac *client.APIClient, request client.RawAp
 			pf.FormatPage(items)
 		}, pagOpts)
 		if err != nil {
-			return output.MarkRaw(output.ErrNetwork("API call failed: %v", err))
+			return err
 		}
-		if apiErr := client.CheckLarkResponse(result); apiErr != nil {
+		if apiErr := ac.CheckResponse(result, pagOpts.Identity); apiErr != nil {
 			output.FormatValue(out, result, output.FormatJSON)
-			return output.MarkRaw(apiErr)
+			return apiErr
 		}
 		if !hasItems {
 			fmt.Fprintf(errOut, "warning: this API does not return a list, format %q is not supported, falling back to json\n", format)
@@ -291,11 +300,11 @@ func apiPaginate(ctx context.Context, ac *client.APIClient, request client.RawAp
 	default:
 		result, err := ac.PaginateAll(ctx, request, pagOpts)
 		if err != nil {
-			return output.MarkRaw(output.ErrNetwork("API call failed: %v", err))
+			return err
 		}
-		if apiErr := client.CheckLarkResponse(result); apiErr != nil {
+		if apiErr := ac.CheckResponse(result, pagOpts.Identity); apiErr != nil {
 			output.FormatValue(out, result, output.FormatJSON)
-			return output.MarkRaw(apiErr)
+			return apiErr
 		}
 		output.FormatValue(out, result, format)
 		return nil
